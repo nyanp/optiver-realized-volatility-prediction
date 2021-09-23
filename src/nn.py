@@ -1,7 +1,9 @@
+
+import gc
 import os
 import pickle
 import random
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -17,7 +19,18 @@ from scipy.interpolate import interp1d
 from scipy.special import erf, erfinv
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import FLOAT_DTYPES, check_array, check_is_fitted
+from sklearn.decomposition import PCA
 
+null_check_cols = [
+    'book.log_return1.realized_volatility',
+    'book_150.log_return1.realized_volatility',
+    'book_300.log_return1.realized_volatility',
+    'book_450.log_return1.realized_volatility',
+    'trade.log_return.realized_volatility',
+    'trade_150.log_return.realized_volatility',
+    'trade_300.log_return.realized_volatility',
+    'trade_450.log_return.realized_volatility'
+]
 
 class GaussRankScaler(BaseEstimator, TransformerMixin):
     """Transform features by scaling each feature to a normal distribution.
@@ -253,7 +266,8 @@ class CNN(nn.Module):
                  weight_norm: bool = True,
                  two_stage: bool = True,
                  celu: bool = True,
-                 kernel1: int = 5):
+                 kernel1: int = 5,
+                 leaky_relu: bool = False):
         super().__init__()
 
         num_targets = 1
@@ -309,11 +323,19 @@ class CNN(nn.Module):
 
         self.flt = nn.Flatten()
 
-        self.dense = nn.Sequential(
-            nn.BatchNorm1d(cha_po_2),
-            nn.Dropout(dropout_bottom),
-            _norm(nn.Linear(cha_po_2, num_targets), dim=0)
-        )
+        if leaky_relu:
+            self.dense = nn.Sequential(
+                nn.BatchNorm1d(cha_po_2),
+                nn.Dropout(dropout_bottom),
+                _norm(nn.Linear(cha_po_2, num_targets), dim=0),
+                nn.LeakyReLU()
+            )
+        else:
+            self.dense = nn.Sequential(
+                nn.BatchNorm1d(cha_po_2),
+                nn.Dropout(dropout_bottom),
+                _norm(nn.Linear(cha_po_2, num_targets), dim=0)
+            )
 
         self.embs = nn.ModuleList([nn.Embedding(x, emb_dim) for x in n_categories])
         self.cat_dim = emb_dim * len(n_categories)
@@ -344,9 +366,13 @@ def preprocess_nn(
         X: pd.DataFrame,
         scaler: Optional[StandardScaler] = None,
         scaler_type: str = 'standard',
-        n_pca: int = -1):
-    for c in X.columns:
-        X[f"{c}_isnull"] = X[c].isnull().astype(int)
+        n_pca: int = -1,
+        na_cols: bool = True):
+    if na_cols:
+        #for c in X.columns:
+        for c in null_check_cols:
+            if c in X.columns:
+                X[f"{c}_isnull"] = X[c].isnull().astype(int)
 
     cat_cols = [c for c in X.columns if c in ['time_id', 'stock_id']]
     num_cols = [c for c in X.columns if c not in cat_cols]
@@ -365,13 +391,13 @@ def preprocess_nn(
             scaler = StandardScaler()
         elif scaler_type == 'gauss':
             scaler = GaussRankScaler()
-            X_num = np.nan_to_num(X_num)
+            X_num = np.nan_to_num(X_num, posinf=0, neginf=0)
         X_num = scaler.fit_transform(X_num)
-        X_num = np.nan_to_num(X_num)
+        X_num = np.nan_to_num(X_num, posinf=0, neginf=0)
         return _pca(X_num), X_cat, cat_cols, scaler
     else:
-        X_num = scaler.transform(X_num)
-        X_num = np.nan_to_num(X_num)
+        X_num = scaler.transform(X_num) #TODO: infでも大丈夫？
+        X_num = np.nan_to_num(X_num, posinf=0, neginf=0)
         return _pca(X_num), X_cat, cat_cols
 
 
@@ -446,11 +472,48 @@ def evaluate(data_loader: DataLoader, model, device):
     return final_outputs, final_targets, losses.avg, metric
 
 
+def predict_nn(X: pd.DataFrame,
+               model: Union[List[MLP], MLP],
+               scaler: StandardScaler,
+               device,
+               ensemble_method='mean'):
+    if not isinstance(model, list):
+        model = [model]
+
+    for m in model:
+        m.eval()
+    X_num, X_cat, cat_cols = preprocess_nn(X.copy(), scaler=scaler)
+    valid_dataset = TabularDataset(X_num, X_cat, None)
+    valid_loader = torch.utils.data.DataLoader(valid_dataset,
+                                               batch_size=512,
+                                               shuffle=False,
+                                               num_workers=4)
+
+    final_outputs = []
+
+    with torch.no_grad():
+        for x_num, x_cat in tqdm(valid_loader, position=0, leave=True, desc='Evaluating'):
+            x_num = x_num.to(device, dtype=torch.float)
+            x_cat = x_cat.to(device)
+
+            outputs = []
+            with torch.no_grad():
+                for m in model:
+                    output = m(x_num, x_cat)
+                    outputs.append(output.detach().cpu().numpy())
+
+            if ensemble_method == 'median':
+                pred = np.nanmedian(np.array(outputs), axis=0)
+            else:
+                pred = np.array(outputs).mean(axis=0)
+            final_outputs.append(pred)
+
+    final_outputs = np.concatenate(final_outputs)
+    return final_outputs
+
 def train_nn(X: pd.DataFrame,
              y: pd.DataFrame,
              folds: List[Tuple],
-             pkl_path: str,
-             model_path: str,
              device,
              emb_dim: int = 25,
              batch_size: int = 1024,
@@ -464,9 +527,11 @@ def train_nn(X: pd.DataFrame,
              cnn_channel3: int = 32,
              cnn_kernel1: int = 5,
              cnn_celu: bool = False,
+             cnn_weight_norm: bool = False,
              dropout_emb: bool = 0.0,
              lr: float = 1e-3,
              weight_decay: float = 0.0,
+             model_path: str = 'fold_{}.pth',
              scaler_type: str = 'standard',
              output_dir: str = 'artifacts',
              scheduler_type: str = 'onecycle',
@@ -475,19 +540,22 @@ def train_nn(X: pd.DataFrame,
              epochs: int = 30,
              seed: int = 42,
              n_pca: int = -1,
-             batch_double_freq: int = 50):
+             batch_double_freq: int = 50,
+             cnn_dropout: float = 0.1,
+             na_cols: bool = True,
+             cnn_leaky_relu: bool = False,
+             patience: int = 8,
+             factor: float = 0.5):
     seed_everything(seed)
 
     os.makedirs(output_dir, exist_ok=True)
 
     y = y.values.astype(np.float32)
-    X_num, X_cat, cat_cols, scaler = preprocess_nn(X, scaler_type=scaler_type, n_pca=n_pca)
-
-    #with open(os.path.join(output_dir, pkl_path), "wb") as f:
-    #    pickle.dump(scaler, f)
+    X_num, X_cat, cat_cols, scaler = preprocess_nn(X.copy(), scaler_type=scaler_type, n_pca=n_pca, na_cols=na_cols)
 
     best_losses = []
     best_predictions = []
+
 
     for cv_idx, (train_idx, valid_idx) in enumerate(folds):
         X_tr, X_va = X_num[train_idx], X_num[valid_idx]
@@ -523,7 +591,12 @@ def train_nn(X: pd.DataFrame,
                         channel_3=cnn_channel3,
                         two_stage=False,
                         kernel1=cnn_kernel1,
-                        celu=cnn_celu)
+                        celu=cnn_celu,
+                        dropout_top=cnn_dropout,
+                        dropout_mid=cnn_dropout,
+                        dropout_bottom=cnn_dropout,
+                        weight_norm=cnn_weight_norm,
+                        leaky_relu=cnn_leaky_relu)
         else:
             raise NotImplementedError()
         model = model.to(device)
@@ -535,12 +608,18 @@ def train_nn(X: pd.DataFrame,
         else:
             raise NotImplementedError()
 
+        scheduler = epoch_scheduler = None
         if scheduler_type == 'onecycle':
             scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=opt, pct_start=0.1, div_factor=1e3,
                                                             max_lr=max_lr, epochs=epochs,
                                                             steps_per_epoch=len(train_loader))
-        else:
-            scheduler = None
+        elif scheduler_type == 'reduce':
+            epoch_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=opt,
+                                                                         mode='min',
+                                                                         min_lr=1e-7,
+                                                                         patience=patience,
+                                                                         verbose=True,
+                                                                         factor=factor)
 
         for epoch in range(epochs):
             if epoch > 0 and epoch % batch_double_freq == 0:
@@ -554,12 +633,20 @@ def train_nn(X: pd.DataFrame,
             predictions, valid_targets, valid_loss, rmspe = evaluate(valid_loader, model, device=device)
             print(f"epoch {epoch}, train loss: {train_loss:.3f}, valid rmspe: {rmspe:.3f}")
 
+            if epoch_scheduler is not None:
+                epoch_scheduler.step(rmspe)
+
             if rmspe < best_loss:
+                print(f'new best:{rmspe}')
                 best_loss = rmspe
                 best_prediction = predictions
-                #torch.save(model, os.path.join(output_dir, model_path))
+                torch.save(model, os.path.join(output_dir, model_path.format(cv_idx)))
 
         best_predictions.append(best_prediction)
         best_losses.append(best_loss)
+        del model, train_dataset, valid_dataset, train_loader, valid_loader, X_tr, X_va, X_tr_cat, X_va_cat, y_tr, y_va, opt
+        if scheduler is not None:
+            del scheduler
+        gc.collect()
 
-    return best_losses, best_predictions
+    return best_losses, best_predictions, scaler
