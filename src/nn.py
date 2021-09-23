@@ -528,6 +528,28 @@ def predict_nn(X: pd.DataFrame,
     return final_outputs
 
 
+def predict_tabnet(X: pd.DataFrame,
+                   model: Union[List[TabNetRegressor], TabNetRegressor],
+                   scaler: StandardScaler,
+                   ensemble_method='mean'):
+    if not isinstance(model, list):
+        model = [model]
+
+    X_num, X_cat, cat_cols = preprocess_nn(X.copy(), scaler=scaler)
+    X_processed = np.concatenate([X_num, X_cat], axis=1)
+
+    predicted = []
+    for m in model:
+        predicted.append(m.predict(X_processed))
+
+    if ensemble_method == 'median':
+        pred = np.nanmedian(np.array(predicted), axis=0)
+    else:
+        pred = np.array(predicted).mean(axis=0)
+
+    return pred
+
+
 def train_tabnet(X: pd.DataFrame,
                  y: pd.DataFrame,
                  folds: List[Tuple],
