@@ -22,6 +22,7 @@ from sklearn.utils.validation import FLOAT_DTYPES, check_array, check_is_fitted
 from sklearn.decomposition import PCA
 from pytorch_tabnet.metrics import Metric
 from pytorch_tabnet.tab_model import TabNetRegressor
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 
 
 null_check_cols = [
@@ -540,7 +541,11 @@ def train_tabnet(X: pd.DataFrame,
                  n_pca: int = -1,
                  na_cols: bool = True,
                  patience: int = 10,
-                 factor: float = 0.5):
+                 factor: float = 0.5,
+                 gamma: float = 2.0,
+                 lambda_sparse: float = 8.0,
+                 n_steps: int = 2,
+                 scheduler_type: str = 'cosine'):
     seed_everything(seed)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -562,22 +567,30 @@ def train_tabnet(X: pd.DataFrame,
 
         cat_idxs = [0]
         cat_dims = [128]
+
+        if scheduler_type == 'cosine':
+            scheduler_params = dict(T_0=200, T_mult=1, eta_min=1e-4, last_epoch=-1, verbose=False)
+            scheduler_fn = CosineAnnealingWarmRestarts
+        else:
+            scheduler_params = {'mode': 'min', 'min_lr': 1e-7, 'patience': patience, 'factor': factor, 'verbose': True}
+            scheduler_fn = torch.optim.lr_scheduler.ReduceLROnPlateau
+
         model = TabNetRegressor(
             cat_idxs=cat_idxs,
             cat_dims=cat_dims,
             cat_emb_dim=1,
             n_d=16,
             n_a=16,
-            n_steps=2,
-            gamma=2,
+            n_steps=n_steps,
+            gamma=gamma,
             n_independent=2,
             n_shared=2,
-            lambda_sparse=8,
+            lambda_sparse=lambda_sparse,
             optimizer_fn=torch.optim.Adam,
             optimizer_params={'lr': lr},
             mask_type="entmax",
-            scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
-            scheduler_params={'mode': 'min', 'min_lr': 1e-7, 'patience': patience, 'factor': factor, 'verbose': True},
+            scheduler_fn=scheduler_fn,
+            scheduler_params=scheduler_params,
             seed=seed,
             verbose=10
             #device_name=device,
