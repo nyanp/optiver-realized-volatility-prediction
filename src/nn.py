@@ -536,7 +536,7 @@ def predict_tabnet(X: pd.DataFrame,
         model = [model]
 
     X_num, X_cat, cat_cols = preprocess_nn(X.copy(), scaler=scaler)
-    X_processed = np.concatenate([X_num, X_cat], axis=1)
+    X_processed = np.concatenate([X_cat, X_num], axis=1)
 
     predicted = []
     for m in model:
@@ -631,7 +631,7 @@ def train_tabnet(X: pd.DataFrame,
         best_losses.append(rmspe)
         best_predictions.append(predicted)
 
-    return best_losses, best_predictions, scaler
+    return best_losses, best_predictions, scaler, model
 
 
 def train_nn(X: pd.DataFrame,
