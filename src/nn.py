@@ -20,6 +20,9 @@ from scipy.special import erf, erfinv
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import FLOAT_DTYPES, check_array, check_is_fitted
 from sklearn.decomposition import PCA
+from pytorch_tabnet.metrics import Metric
+from pytorch_tabnet.tab_model import TabNetRegressor
+
 
 null_check_cols = [
     'book.log_return1.realized_volatility',
@@ -161,6 +164,18 @@ def rmspe_metric(y_true, y_pred):
 def rmspe_loss(y_true, y_pred):
     rmspe = torch.sqrt(torch.mean(torch.square((y_true - y_pred) / y_true)))
     return rmspe
+
+
+class RMSPE(Metric):
+    def __init__(self):
+        self._name = "rmspe"
+        self._maximize = False
+
+    def __call__(self, y_true, y_score):
+        return np.sqrt(np.mean(np.square((y_true - y_score) / y_true)))
+
+def RMSPELoss_Tabnet(y_pred, y_true):
+    return torch.sqrt(torch.mean( ((y_true - y_pred) / y_true) ** 2 )).clone()
 
 
 class AverageMeter:
@@ -511,6 +526,79 @@ def predict_nn(X: pd.DataFrame,
     final_outputs = np.concatenate(final_outputs)
     return final_outputs
 
+
+def train_tabnet(X: pd.DataFrame,
+                 y: pd.DataFrame,
+                 folds: List[Tuple],
+                 batch_size: int = 1024,
+                 lr: float = 1e-3,
+                 model_path: str = 'fold_{}.pth',
+                 scaler_type: str = 'standard',
+                 output_dir: str = 'artifacts',
+                 epochs: int = 250,
+                 seed: int = 42,
+                 n_pca: int = -1,
+                 na_cols: bool = True,
+                 patience: int = 10,
+                 factor: float = 0.5):
+    seed_everything(seed)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    y = y.values.astype(np.float32)
+    X_num, X_cat, cat_cols, scaler = preprocess_nn(X.copy(), scaler_type=scaler_type, n_pca=n_pca, na_cols=na_cols)
+
+    best_losses = []
+    best_predictions = []
+
+    for cv_idx, (train_idx, valid_idx) in enumerate(folds):
+        X_tr, X_va = X_num[train_idx], X_num[valid_idx]
+        X_tr_cat, X_va_cat = X_cat[train_idx], X_cat[valid_idx]
+        y_tr, y_va = y[train_idx], y[valid_idx]
+        y_tr = y_tr.reshape(-1,1)
+        y_va = y_va.reshape(-1,1)
+        X_tr = np.concatenate([X_tr_cat, X_tr], axis=1)
+        X_va = np.concatenate([X_va_cat, X_va], axis=1)
+
+        cat_idxs = [0]
+        cat_dims = [128]
+        model = TabNetRegressor(
+            cat_idxs=cat_idxs,
+            cat_dims=cat_dims,
+            cat_emb_dim=1,
+            n_d=16,
+            n_a=16,
+            n_steps=2,
+            gamma=2,
+            n_independent=2,
+            n_shared=2,
+            lambda_sparse=8,
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params={'lr': lr},
+            mask_type="entmax",
+            scheduler_fn=torch.optim.lr_scheduler.ReduceLROnPlateau,
+            scheduler_params={'mode': 'min', 'min_lr': 1e-7, 'patience': patience, 'factor': factor, 'verbose': True},
+            seed=seed,
+            verbose=10
+            #device_name=device,
+            #clip_value=1.5
+        )
+
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], max_epochs=epochs, patience=50, batch_size=1024*20,
+                  virtual_batch_size=batch_size, num_workers=4, drop_last=False, eval_metric=[RMSPE], loss_fn=RMSPELoss_Tabnet)
+
+        path = os.path.join(output_dir, model_path.format(cv_idx))
+        model.save_model(path)
+
+        predicted = model.predict(X_va)
+
+        rmspe = rmspe_metric(y_va, predicted)
+        best_losses.append(rmspe)
+        best_predictions.append(predicted)
+
+    return best_losses, best_predictions, scaler
+
+
 def train_nn(X: pd.DataFrame,
              y: pd.DataFrame,
              folds: List[Tuple],
@@ -555,7 +643,6 @@ def train_nn(X: pd.DataFrame,
 
     best_losses = []
     best_predictions = []
-
 
     for cv_idx, (train_idx, valid_idx) in enumerate(folds):
         X_tr, X_va = X_num[train_idx], X_num[valid_idx]
